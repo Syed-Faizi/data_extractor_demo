@@ -71,13 +71,14 @@ def stats_html(docs="—", clean="—", review="—", secs="—"):
 HERO = f"""
 <div class="hero">
   <div class="hero-badge">Document AI · OCR + LLM</div>
-  <h1>Invoice &amp; Document <span>Data Extractor</span></h1>
-  <p>Drop in invoices or receipts — digital PDFs, scans or phone photos.
+  <h1>Invoice &amp; Medical Bill <span>Data Extractor</span></h1>
+  <p>Drop in invoices, medical bills or workers' comp EORs — digital PDFs, scans or phone photos.
      Get every field extracted, every number checked, and one clean Excel file.</p>
   <div class="chips">
     <span class="chip">🧠 {LLM_MODEL}</span>
     <span class="chip">⚙️ {ENGINE}</span>
     <span class="chip">📄 Up to {MAX_PAGES} pages / file</span>
+    <span class="chip">🔒 Demo: {RUNS_PER_USER} runs/day, {MAX_FILES_PER_RUN} files/run</span>
   </div>
 </div>
 """
@@ -175,21 +176,30 @@ def run(files, request: gr.Request):
         status = "✅ OK" if not r["issues"] else "⚠️ Check"
         row = {"File": name, "Pages": r.get("pages", "1/1"), "Status": status}
         if inv:
+            dos = sorted(li.date_of_service for li in inv.line_items if li.date_of_service)
             row.update({
-                "Vendor": inv.vendor_name, "Invoice #": inv.invoice_number,
-                "Date": inv.invoice_date, "Due": inv.due_date,
-                "Currency": inv.currency, "Subtotal": inv.subtotal,
-                "Tax": inv.tax, "Total": inv.total,
+                "Type": inv.document_type, "Issued by": inv.vendor_name,
+                "Invoice / Statement #": inv.invoice_number, "Date": inv.invoice_date,
+                "Due": inv.due_date, "Patient": inv.patient_name, "Provider": inv.provider_name,
+                "Date of injury": inv.date_of_injury,
+                "DOS": (dos[0] if dos and dos[0] == dos[-1] else f"{dos[0]} to {dos[-1]}") if dos else None,
+                "Claim #": inv.claim_number, "Carrier": inv.payer_name, "Employer": inv.employer,
+                "Currency": inv.currency,
+                "Subtotal": inv.subtotal, "Tax": inv.tax, "Total": inv.total,
+                "Allowed": inv.amount_allowed, "Paid": inv.amount_paid,
             })
             for li in inv.line_items:
-                items.append({"File": name, "Invoice #": inv.invoice_number,
-                              **li.model_dump()})
+                items.append({"File": name, "Invoice / Statement #": inv.invoice_number,
+                              "Patient": inv.patient_name, **li.model_dump()})
             details[name] = inv.model_dump()
         row["Issues"] = "; ".join(r["issues"])
         summary.append(row)
 
-    summary_df = pd.DataFrame(summary)
-    items_df = pd.DataFrame(items)
+    summary_df = pd.DataFrame(summary).dropna(axis=1, how="all")
+    items_df = pd.DataFrame(items).rename(columns={
+        "date_of_service": "DOS", "code": "Code", "description": "Description",
+        "quantity": "Qty", "unit_price": "Unit price", "amount": "Amount",
+        "allowed": "Allowed", "paid": "Paid", "reason_code": "Reason"}).dropna(axis=1, how="all")
 
     out = os.path.join(tempfile.gettempdir(),
                        f"extracted_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
@@ -225,7 +235,7 @@ with gr.Blocks(title="Invoice & Document Data Extractor") as demo:
             if os.path.isdir(SAMPLES_DIR):
                 samples = sorted(os.path.join(SAMPLES_DIR, s) for s in os.listdir(SAMPLES_DIR))
                 gr.Examples(examples=[[samples]], inputs=files,
-                            label="No files handy? Load 3 sample invoices")
+                            label="No files handy? Load 3 sample medical documents")
             btn = gr.Button("⚡ Extract data", elem_id="run-btn")
 
         with gr.Column(scale=8):

@@ -1,5 +1,5 @@
 """
-Core pipeline: file -> text (native PDF text or OCR) -> LLM -> validated JSON.
+Core pipeline: file -> page images -> table-line removal -> OCR -> LLM -> validated JSON.
 
 Works with the OpenAI API by default. Point OPENAI_BASE_URL at any
 OpenAI-compatible server (Ollama, llama.cpp, vLLM) to run fully local.
@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+import cv2
+import numpy as np
 import pymupdf
 import pytesseract
 from openai import OpenAI
@@ -33,18 +35,33 @@ if os.getenv("TESSERACT_CMD"):  # Windows users can point to tesseract.exe
 
 # ---------- Output schema ----------
 class LineItem(BaseModel):
+    date_of_service: Optional[str] = None  # YYYY-MM-DD (medical bills)
+    code: Optional[str] = None             # CPT / HCPCS / revenue code / SKU
     description: Optional[str] = None
     quantity: Optional[float] = None
     unit_price: Optional[float] = None
-    amount: Optional[float] = None
+    amount: Optional[float] = None         # billed / charged amount
+    allowed: Optional[float] = None        # EOR only
+    paid: Optional[float] = None           # EOR only
+    reason_code: Optional[str] = None      # EOR only
 
 
 class Invoice(BaseModel):
-    vendor_name: Optional[str] = None
-    invoice_number: Optional[str] = None
+    document_type: Optional[str] = None  # invoice | receipt | medical_bill | eor
+    vendor_name: Optional[str] = None    # company / practice / hospital that issued it
+    invoice_number: Optional[str] = None # invoice, statement or account number
     invoice_date: Optional[str] = None   # YYYY-MM-DD
     due_date: Optional[str] = None       # YYYY-MM-DD
     bill_to: Optional[str] = None
+    # medical fields (null for normal invoices)
+    patient_name: Optional[str] = None
+    provider_name: Optional[str] = None  # treating doctor / rendering provider
+    date_of_injury: Optional[str] = None # YYYY-MM-DD
+    claim_number: Optional[str] = None
+    payer_name: Optional[str] = None     # insurance carrier
+    employer: Optional[str] = None       # workers' comp employer
+    amount_allowed: Optional[float] = None  # EOR only
+    amount_paid: Optional[float] = None     # EOR only
     currency: Optional[str] = None
     subtotal: Optional[float] = None
     tax: Optional[float] = None
@@ -53,27 +70,57 @@ class Invoice(BaseModel):
 
 
 REQUIRED_FIELDS = ["vendor_name", "invoice_number", "invoice_date", "total"]
+REQUIRED_MEDICAL = ["patient_name", "provider_name"]
 
-PROMPT = """You extract data from invoices and receipts.
+PROMPT = """You extract data from invoices, receipts, medical bills and workers' compensation
+EORs (Explanation of Review / Explanation of Bill Review).
 
 The document text is given page by page. Each page is wrapped like this:
 <<PAGE 1 START>>
 ...text of page 1...
 <<PAGE 1 END>>
 The markers are NOT part of the document; they only show where each page begins and ends.
-The text may come from OCR and contain small errors (e.g. "O" for "0"); read it carefully.
-An invoice can continue across pages: line items may be split over several pages, and the
+The text may come from OCR and contain small errors (e.g. "O" for "0", "1" for "I" in
+diagnosis codes like I10); read it carefully.
+A document can continue across pages: line items may be split over several pages, and the
 totals are usually on the last page. Combine all pages into ONE result and do not
 list the same line item twice.
 
 Return ONLY a JSON object with exactly these keys:
-vendor_name, invoice_number, invoice_date, due_date, bill_to, currency,
-subtotal, tax, total, line_items (list of {description, quantity, unit_price, amount}).
+document_type ("invoice", "receipt", "medical_bill" or "eor"),
+vendor_name (company, practice or hospital that issued the document; for an EOR, the
+  billing provider organization, NOT the carrier),
+invoice_number (invoice, statement or account number),
+invoice_date (invoice or statement date), due_date, bill_to,
+patient_name, provider_name (the treating / rendering doctor, not the practice),
+date_of_injury, claim_number, payer_name (insurance carrier), employer,
+amount_allowed, amount_paid,
+currency, subtotal, tax, total,
+line_items (list of {date_of_service, code, description, quantity, unit_price, amount,
+  allowed, paid, reason_code}).
 
 Rules:
 - Use null when a value is not in the document. Never guess or calculate missing values.
+- Medical fields (patient_name, provider_name, date_of_injury, claim_number, payer_name,
+  employer, date_of_service) are null for normal invoices and receipts.
+- For an EOR: invoice_number = bill control number, invoice_date = date the EOR was
+  generated, subtotal = total = total billed, amount_allowed = total allowed,
+  amount_paid = total paid. Per line: amount = billed, allowed, paid, reason_code.
+  In an EOR the BILLED column is already the line total for all units: copy it as
+  amount, do NOT multiply it by units, and leave unit_price null.
+  The lockbox / bank header at the top of a scanned page (processing date, batch number,
+  etc.) is NOT part of the document; ignore it.
+- code: CPT / HCPCS / revenue code for medical lines, SKU or item code otherwise.
+- For medical bills: subtotal = total charges; total = the amount the patient or payer
+  still owes (balance due), if shown, otherwise total charges.
+- If unit price is missing but quantity and amount are shown, leave unit_price null.
+- IDs (claim, account, statement, bill numbers): remove stray spaces that OCR inserted
+  inside them (e.g. "WC-2026-0451 187" -> "WC-2026-0451187").
+- Reason codes are short letter+digit codes (P1, D4); OCR may read "1" as "l" (e.g. "Pl"),
+  fix that.
 - Dates as YYYY-MM-DD.
 - Numbers as plain numbers (no currency symbols, no thousands separators).
+  Credits and payments shown as negative stay negative.
 - currency as a 3-letter code (USD, EUR, PKR...) only if it is shown or clearly implied.
 
 Document ({n_pages} page(s)):
@@ -82,9 +129,23 @@ Document ({n_pages} page(s)):
 
 
 # ---------- Step 1: get text, page by page ----------
+def _remove_table_lines(gray: np.ndarray) -> np.ndarray:
+    """Erase long horizontal/vertical lines (table grids) so OCR doesn't break on them.
+    Only the line pixels are whitened; the rest of the image is left untouched."""
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    k = max(40, gray.shape[1] // 30)  # a "line" is at least ~1/30 of the page width
+    horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+    vert = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    lines = cv2.dilate(cv2.add(horiz, vert), np.ones((3, 3), np.uint8))
+    out = gray.copy()
+    out[lines > 0] = 255
+    return out
+
+
 def _ocr_image(img: Image.Image) -> str:
+    gray = _remove_table_lines(np.array(img.convert("L")))
     # psm 6 = treat page as one text block; keeps labels and amounts on the same line
-    return pytesseract.image_to_string(img.convert("L"), config="--psm 6")
+    return pytesseract.image_to_string(gray, config="--psm 6")
 
 
 def _wrap(page_no: int, text: str) -> str:
@@ -190,6 +251,33 @@ def validate(inv: Invoice) -> list[str]:
 
     if inv.invoice_date and inv.due_date and inv.due_date < inv.invoice_date:
         issues.append("Due date is before invoice date")
+
+    if inv.document_type in ("medical_bill",):
+        for f in REQUIRED_MEDICAL:
+            if not getattr(inv, f):
+                issues.append(f"Missing {f.replace('_', ' ')}")
+        dos = [li.date_of_service for li in inv.line_items if li.date_of_service]
+        for d in dos + ([inv.date_of_injury] if inv.date_of_injury else []):
+            try:
+                datetime.strptime(d, "%Y-%m-%d")
+            except ValueError:
+                issues.append(f"Not a valid date: {d}")
+        if inv.date_of_injury and any(d < inv.date_of_injury for d in dos):
+            issues.append("A date of service is before the date of injury")
+
+    if inv.document_type == "eor":
+        for f in ["patient_name", "claim_number", "date_of_injury", "payer_name"]:
+            if not getattr(inv, f):
+                issues.append(f"Missing {f.replace('_', ' ')}")
+        dos = [li.date_of_service for li in inv.line_items if li.date_of_service]
+        if inv.date_of_injury and any(d < inv.date_of_injury for d in dos):
+            issues.append("A date of service is before the date of injury")
+        paid = [li.paid for li in inv.line_items if li.paid is not None]
+        if paid and inv.amount_paid is not None and not _close(sum(paid), inv.amount_paid):
+            issues.append(f"Line payments add up to {sum(paid):.2f}, EOR says paid {inv.amount_paid:.2f}")
+        for i, li in enumerate(inv.line_items, 1):
+            if None not in (li.paid, li.allowed) and li.paid > li.allowed + MONEY_TOLERANCE:
+                issues.append(f"Line {i}: paid more than allowed")
 
     for i, li in enumerate(inv.line_items, 1):
         if None not in (li.quantity, li.unit_price, li.amount):

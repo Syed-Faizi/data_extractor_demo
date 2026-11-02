@@ -16,7 +16,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
-OUT = os.path.join(os.path.dirname(__file__), "samples")
+OUT = os.path.join(os.path.dirname(__file__), "demo_docs")
 os.makedirs(OUT, exist_ok=True)
 W, H = A4
 
